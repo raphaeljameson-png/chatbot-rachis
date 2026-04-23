@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Par défaut : tout est interdit côté client.
+    // Les Firebase Functions backend utilisent les credentials admin
+    // et bypassent ces règles. C'est intentionnel et sécurisant :
+    // aucun client ne peut lire les fiches indexées, les logs,
+    // ou manipuler le rate limiting directement.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
