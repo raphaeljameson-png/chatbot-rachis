@@ -1,0 +1,15 @@
+{
+  "name": "chatbot-rachis-scripts",
+  "description": "Scripts d'indexation et d'administration",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  },
+  "scripts": {
+    "index": "node index-fiches.js",
+    "test-query": "node test-query.js"
+  },
+  "private": true
+}
