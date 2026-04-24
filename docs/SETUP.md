@@ -4,14 +4,22 @@ Guide complet pour passer d'un repo vide à un chatbot en production. Durée est
 
 Ce guide suppose que tu es sur macOS ou Linux. Sur Windows, utilise Git Bash ou WSL.
 
+> **Rappel des identifiants Firebase**
+> - Project ID : `chatbot-rachis`
+> - Numéro du projet : `243734560305`
+> - Organisation GCP : `rachis.paris`
+> - Région Functions : `europe-west1`
+> - URL finale de la Function : `https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot`
+
 ---
 
 ## Prérequis
 
 Tu dois avoir :
 - Un compte **GitHub** (déjà fait : `raphaeljameson-png`)
-- Un compte **Anthropic** avec clé API (déjà fait via Opti'CCAM)
-- Un compte **Google / Firebase** (déjà fait via opticcam)
+- Un compte **Anthropic** avec clé API (déjà fait via Optim'CCAM)
+- Un projet **Firebase `chatbot-rachis`** créé (déjà fait — voir plus haut)
+- Le plan Firebase **Blaze** activé sur ce projet (nécessaire pour Cloud Functions)
 - **Node.js 20+** installé localement
 - **Firebase CLI** installé : `npm install -g firebase-tools`
 - **git** installé
@@ -29,37 +37,32 @@ Tu dois avoir :
 
 ---
 
-## Étape 2 — Créer le projet Firebase (10 min)
+## Étape 2 — Vérifier le projet Firebase (2 min)
 
-1. Va sur [console.firebase.google.com](https://console.firebase.google.com/)
-2. Clique **Ajouter un projet**
-3. Nom : `chatbot-rachis` (ou ce que tu veux, mais retiens bien le Project ID, il servira partout)
-4. Désactive Google Analytics (inutile ici)
-5. Une fois le projet créé :
-   - Active **Firestore Database** : menu gauche → Firestore Database → Create database → production mode → region **europe-west1** (Belgique, plus proche de Paris)
-   - Passe le projet en plan **Blaze** (pay-as-you-go) : menu “‽” en bas → Usage and billing → Modify plan → Blaze
-     - ⚠ C'est obligatoire pour utiliser Cloud Functions. En pratique, tu resteras dans le quota gratuit tant que tu n'as pas des milliers de conversations par jour.
-     - Active une alerte budget à 5 €/mois par sécurité
-6. Récupère ton **Project ID** (visible en haut de la page du projet, ex. `chatbot-rachis-a1b2c3`)
+Projet `chatbot-rachis` déjà créé. Confirme juste dans la console :
+
+1. [console.firebase.google.com/project/chatbot-rachis](https://console.firebase.google.com/project/chatbot-rachis)
+2. Active **Firestore Database** si ce n'est pas déjà fait :
+   - Menu gauche → Firestore Database → Create database → **production mode** → région **europe-west1** (Belgique)
+3. Vérifie que le projet est bien en plan **Blaze** (sinon, Usage and billing → Modify plan → Blaze)
+4. Active une **alerte budget à 5 €/mois** par sécurité : Google Cloud Console → Billing → Budgets & Alerts
 
 ---
 
-## Étape 3 — Cloner le repo et configurer Firebase CLI (5 min)
+## Étape 3 — Cloner le repo et configurer Firebase CLI (3 min)
 
 ```bash
 # Clone le repo localement
 git clone https://github.com/raphaeljameson-png/chatbot-rachis.git
 cd chatbot-rachis
 
-# Copie le template .firebaserc et mets ton Project ID
-cp .firebaserc.example .firebaserc
-# Édite .firebaserc et remplace REMPLACEZ-PAR-VOTRE-PROJECT-ID par ton vrai ID
-# Exemple : "default": "chatbot-rachis-a1b2c3"
+# Le fichier .firebaserc est déjà pré-configuré avec chatbot-rachis, rien à faire.
 
 # Connecte Firebase CLI à ton compte Google
 firebase login
 
 # Vérifie que le projet est bien pris en compte
+firebase use chatbot-rachis
 firebase projects:list
 ```
 
@@ -72,9 +75,9 @@ firebase deploy --only firestore:rules
 firebase deploy --only firestore:indexes
 ```
 
-⚠ **L'index vectoriel prend 5-10 minutes à se construire en arrière-plan.** C'est Firebase qui le fait, tu n'as pas besoin d'attendre pour continuer. Par contre, l'indexation (étape 6) échouera si tu la lances trop vite. Tu vérifieras dans la console Firestore que l'index est en état **Ready** avant l'étape 6.
+⚠ **L'index vectoriel prend 5-10 minutes à se construire en arrière-plan.** C'est Firebase qui le fait, tu n'as pas besoin d'attendre pour continuer. Par contre, l'indexation (étape 6) échouera si tu la lances trop vite.
 
-Pour vérifier :
+Pour vérifier l'état de l'index :
 - Console Firebase → Firestore → onglet **Indexes** → sous-onglet **Vector**
 - L'index sur `fiches_chunks.embedding` doit passer de `Building` à `Ready`
 
@@ -102,7 +105,7 @@ Pour que le script puisse écrire dans Firestore, il lui faut un **service accou
 
 1. Console Firebase → Paramètres du projet (roue crantée en haut à gauche) → **Service accounts**
 2. Clique **Generate new private key** → confirme
-3. Un fichier JSON est téléchargé. Renomme-le `firebase-service-account.json` et place-le **en dehors** du repo (par exemple dans `~/keys/`) — ce fichier ne doit JAMAIS être commité
+3. Un fichier JSON est téléchargé. Renomme-le `firebase-service-account.json` et place-le **en dehors** du repo (par exemple dans `~/keys/`) — ce fichier ne doit JAMAIS être commité. Le `.gitignore` du projet le bloque déjà par sécurité.
 
 Puis :
 
@@ -174,13 +177,11 @@ cd ..
 firebase deploy --only functions
 ```
 
-À la fin tu verras l'URL de la fonction :
+À la fin tu verras l'URL de la fonction, qui doit être **exactement** :
 
 ```
-Function URL (askChatbot): https://europe-west1-chatbot-rachis-a1b2c3.cloudfunctions.net/askChatbot
+Function URL (askChatbot): https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot
 ```
-
-**Note cette URL**, tu en auras besoin pour l'intégration dans le portail des fiches.
 
 ---
 
@@ -191,7 +192,7 @@ curl -X POST \
   -H "Content-Type: application/json" \
   -H "Origin: https://raphaeljameson-png.github.io" \
   -d '{"question":"quels documents apporter","sessionId":"test_session_123"}' \
-  https://europe-west1-TON-PROJECT-ID.cloudfunctions.net/askChatbot
+  https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot
 ```
 
 Tu dois recevoir une réponse JSON avec `reponse`, `sources`, `remaining`.
@@ -208,7 +209,7 @@ Voir [`INTEGRATION.md`](INTEGRATION.md) pour le patch à appliquer au repo `fich
 
 ### Quand tu modifies une fiche
 
-Relance simplement l'étape 6 (indexation). Le script efface et ré-indexe tout, c'est idémpotent. Durée : ~2 minutes.
+Relance simplement l'étape 6 (indexation). Le script efface et ré-indexe tout, c'est idempotent. Durée : ~2 minutes.
 
 ### Quand tu modifies le system prompt
 
