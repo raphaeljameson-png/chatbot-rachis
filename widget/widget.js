@@ -1,6 +1,6 @@
 /**
  * widget.js — Assistant d'information EFR
- * Version : 1.0.0
+ * Version : 1.1.0 (scope souple : priorisation fiche courante)
  *
  * Intégration : ajouter dans <body> :
  *   <script src="https://.../widget.js"
@@ -12,8 +12,15 @@
  *   data-api-url   : URL de la Firebase Function askChatbot (obligatoire)
  *   data-context   : contexte d'entrée (optionnel : default, preop-admin, postop-hernie, postop-lombaire, kine)
  *   data-auto-open : "true" pour ouvrir automatiquement (pratique pour QR codes)
+ *   data-fiche-path : override manuel du chemin de fiche (ex: "cervical/acdf.html"). Normalement auto-détecté.
+ *   data-fiche-region : override manuel de la région (ex: "cervical"). Normalement auto-détecté.
  *
  * L'auto-open peut aussi être déclenché par ?chat=open dans l'URL de la page.
+ *
+ * Détection automatique de la fiche courante :
+ *   Le widget parse window.location.pathname pour extraire le dossier et le nom de fiche.
+ *   Ex: /fiches-information-patient/cervical/acdf.html → region="cervical", path="cervical/acdf.html"
+ *   Cette info est envoyée au backend pour prioriser les chunks RAG de la fiche courante.
  *
  * Le widget crée un bouton flottant + une fenêtre de chat.
  * Sur mobile (≤ 640px) la fenêtre s'affiche en plein écran.
@@ -36,6 +43,44 @@
     console.error("[EFR Chatbot] data-api-url manquante sur le tag script, widget désactivé.");
     return;
   }
+
+  // ─── Détection automatique de la fiche courante ────────────────────────
+  // Régions valides (doivent matcher fiche_region dans Firestore)
+  const VALID_REGIONS = ["cervical", "lombaire", "sacro-iliaque", "procedures", "ressources"];
+
+  function detectCurrentFiche() {
+    // Override manuel prioritaire
+    const overridePath = currentScript.dataset.fichePath || "";
+    const overrideRegion = currentScript.dataset.ficheRegion || "";
+    if (overridePath && overrideRegion && VALID_REGIONS.includes(overrideRegion)) {
+      return { path: overridePath, region: overrideRegion };
+    }
+
+    // Auto-détection depuis l'URL
+    const pathname = window.location.pathname || "";
+    // Cherche un segment "cervical/xxx.html", "lombaire/xxx.html", etc.
+    // Gère les cas :
+    //   /fiches-information-patient/cervical/acdf.html
+    //   /cervical/acdf.html
+    //   /subdir/cervical/acdf.html
+    for (const region of VALID_REGIONS) {
+      // Regex : /REGION/FICHIER.html (insensible à la casse sur le nom de fichier)
+      const rx = new RegExp(`/(${region})/([^/]+\\.html?)(?:[?#]|$)`, "i");
+      const m = pathname.match(rx);
+      if (m) {
+        const filename = m[2];
+        return {
+          path: `${region}/${filename}`,
+          region: region,
+        };
+      }
+    }
+
+    // Cas fiche index.html ou portail racine — pas de fiche spécifique
+    return { path: null, region: null };
+  }
+
+  const CURRENT_FICHE = detectCurrentFiche();
 
   // ─── Session ID stable (stocké dans sessionStorage) ─────────────────────
   function getSessionId() {
@@ -428,6 +473,8 @@
           question: q,
           sessionId: SESSION_ID,
           history: history,
+          pageFiche: CURRENT_FICHE.path,    // ex: "cervical/acdf.html" ou null
+          pageRegion: CURRENT_FICHE.region, // ex: "cervical" ou null
         }),
       });
       removeTyping();
@@ -466,4 +513,11 @@
       ask(input.value);
     }
   });
+
+  // Log console de confirmation (visible uniquement en F12)
+  if (CURRENT_FICHE.path) {
+    console.log(`[EFR Chatbot v1.1] Fiche courante détectée : ${CURRENT_FICHE.path} (${CURRENT_FICHE.region})`);
+  } else {
+    console.log("[EFR Chatbot v1.1] Pas de fiche courante détectée — recherche globale");
+  }
 })();
