@@ -155,64 +155,30 @@ async function findRelevantChunksGlobal(queryEmbedding, limit = 5) {
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
-// ─── Recherche vectorielle Firestore — filtrée sur une fiche précise ─────
-async function findRelevantChunksFiltered(queryEmbedding, filter, limit) {
-  const db = admin.firestore();
-  try {
-    let q = db.collection("fiches_chunks");
-    // Firestore findNearest supporte le pré-filtrage via .where()
-    if (filter.fichePath) {
-      q = q.where("fiche_path", "==", filter.fichePath);
-    } else if (filter.region) {
-      q = q.where("fiche_region", "==", filter.region);
-    }
-    const snap = await q
-      .findNearest({
-        vectorField: "embedding",
-        queryVector: admin.firestore.FieldValue.vector(queryEmbedding),
-        limit: limit,
-        distanceMeasure: "COSINE",
-      })
-      .get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  } catch (err) {
-    // Si le pré-filtrage nécessite un index composite qui n'existe pas encore,
-    // on ne fait pas planter la requête : on renvoie juste un tableau vide
-    // et le pass global prendra le relais.
-    console.warn("findRelevantChunksFiltered warning:", err.message);
-    return [];
-  }
-}
-
 /**
- * Stratégie de récupération "scope souple".
- * - Si pageFiche fourni : récupère 4 chunks de cette fiche précise + 4 globaux
- * - Sinon : tombe sur la recherche globale seule (top 6)
- * Les chunks de la fiche courante sont marqués avec scope = "current" pour que
- * le prompt builder puisse les présenter en priorité au modèle.
+ * Stratégie de récupération "scope souple" — in-memory split.
+ * Firestore ne dispose pas encore des index composites (fiche_path + embedding)
+ * nécessaires au pré-filtrage natif. On compense en récupérant les top 20 globaux
+ * et en séparant en mémoire : chunks de la fiche courante (scope="current") vs
+ * autres fiches (scope="global"). Pénalité minimale : 216 chunks au total.
+ * Quand les index composites seront READY, on pourra revenir à 2 passes parallèles.
  */
 async function retrieveChunks(queryEmbedding, { pageFiche, pageRegion }) {
-  // Cas "pas de fiche courante" : recherche globale simple (ex: patient sur /index.html ou URL externe)
   if (!pageFiche || !pageRegion) {
-    const global = await findRelevantChunksGlobal(queryEmbedding, 6);
-    return global.map(c => ({ ...c, scope: "global" }));
+    const results = await findRelevantChunksGlobal(queryEmbedding, 6);
+    return results.map(c => ({ ...c, scope: "global" }));
   }
 
-  // Pass 1 + Pass 2 en parallèle pour minimiser la latence
-  const [fromFiche, global] = await Promise.all([
-    findRelevantChunksFiltered(queryEmbedding, { fichePath: pageFiche }, 4),
-    findRelevantChunksGlobal(queryEmbedding, 6),
-  ]);
+  const results = await findRelevantChunksGlobal(queryEmbedding, 20);
 
-  // Marque le scope et déduplique par ID (si un chunk de la fiche apparaît aussi en global)
+  const fromFiche = results.filter(c => c.fiche_path === pageFiche).slice(0, 4);
   const currentIds = new Set(fromFiche.map(c => c.id));
-  const currentMarked = fromFiche.map(c => ({ ...c, scope: "current" }));
-  const globalMarked = global
-    .filter(c => !currentIds.has(c.id))
-    .slice(0, 4) // max 4 chunks globaux en complément
-    .map(c => ({ ...c, scope: "global" }));
+  const globalRest = results.filter(c => !currentIds.has(c.id)).slice(0, 4);
 
-  return [...currentMarked, ...globalMarked];
+  return [
+    ...fromFiche.map(c => ({ ...c, scope: "current" })),
+    ...globalRest.map(c => ({ ...c, scope: "global" })),
+  ];
 }
 
 // ─── Construction du contexte pour le LLM ────────────────────────────────
