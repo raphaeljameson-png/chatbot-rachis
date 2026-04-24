@@ -1,15 +1,21 @@
 /**
- * functions/index.js — Backend Chatbot patient EFR v1.2
+ * functions/index.js — Backend Chatbot patient EFR v1.3
  *
  * Fonction principale :
  *   - askChatbot : pipeline RAG complet (embed query → search Firestore → LLM response)
  *
+ * v1.3 — "Rolls-Royce avec frein à main" :
+ *   - Modèle Claude Opus 4.7 (claude-opus-4-7) au lieu de Haiku 4.5 pour qualité max
+ *   - Prompt caching activé sur system prompt + RAG context (économie ~45% input)
+ *   - Mode hybride déclaré : Claude peut s'appuyer sur ses connaissances médicales
+ *     générales SI les fiches EFR ne couvrent pas le sujet, avec avertissement clair
+ *     et systématique que l'info ne provient pas d'une source EFR officielle
+ *   - Extended thinking désactivé par défaut, activable via { deep_thinking: true }
+ *     dans le body de la requête (pour usage futur premium)
+ *
  * v1.2 — Scope souple (priorisation fiche courante) :
- *   - Accepte pageFiche et pageRegion du widget
- *   - Pass 1 : top 4 chunks filtrés sur la fiche courante (priorité absolue)
- *   - Pass 2 : top 4 chunks globaux (fallback / questions hors scope)
- *   - Déduplication par ID, ordre garantit que les chunks de la fiche apparaissent en premier
- *   - System prompt enrichi : Claude sait sur quelle fiche est l'utilisateur
+ *   - pageFiche/pageRegion transmis par le widget → chunks fiche courante prioritaires
+ *   - Split in-memory (pas besoin d'index composite Firestore)
  *
  * Secrets requis (Firebase Secret Manager) :
  *   firebase functions:secrets:set VOYAGE_API_KEY
@@ -29,6 +35,11 @@ admin.initializeApp();
 
 const VOYAGE_API_KEY = defineSecret("VOYAGE_API_KEY");
 const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
+
+// ─── Configuration modèle Anthropic ──────────────────────────────────────
+const ANTHROPIC_MODEL = "claude-opus-4-7";
+const ANTHROPIC_MAX_TOKENS = 800; // +200 vs Haiku pour laisser respirer les réponses hybrides
+const ANTHROPIC_THINKING_BUDGET_TOKENS = 2000; // Utilisé uniquement si deep_thinking=true
 
 // ─── CORS Origins autorisés ──────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -55,6 +66,7 @@ const VALID_REGIONS = ["cervical", "lombaire", "sacro-iliaque", "procedures", "r
 
 // ─── System prompt : le cœur des garde-fous médicaux ─────────────────────
 // Note : le contexte RAG et l'info sur la fiche courante sont ajoutés dynamiquement dans callClaude.
+// Ce prompt est gardé stable pour maximiser les cache hits sur Anthropic (économie ~90% sur input cached).
 const SYSTEM_PROMPT = `Tu es l'assistant d'information de l'Espace Francilien du Rachis (EFR), cabinet chirurgical dirigé par le Dr Raphaël Jameson, le Dr Mayalen Lamerain et le Dr Christophe Travert, spécialisés dans la chirurgie du rachis. Le cabinet est situé au 95 rue de Prony, 75017 Paris.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -65,6 +77,7 @@ Tu aides les patients avec :
   • Les démarches administratives avant et après une intervention
   • Les consignes générales du parcours de soins (jeûne, documents, ordonnances type)
   • Les informations générales sur les interventions décrites dans les fiches officielles EFR
+  • Les questions périphériques courantes (reprise du travail, ergonomie, suites normales, questions administratives) — même si elles ne sont pas dans les fiches EFR, à condition de respecter le protocole ci-dessous.
 
 Tu NE fais PAS :
   • De diagnostic médical, même hypothétique
@@ -73,19 +86,46 @@ Tu NE fais PAS :
   • De pronostic individuel ("quand je vais guérir", "est-ce normal que…")
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HIÉRARCHIE DE SOURCES (TRÈS IMPORTANT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIORITÉ 1 — FICHE COURANTE
+Les extraits fournis sous "FICHE COURANTE" sont la source prioritaire absolue. Si la réponse y figure, utilise uniquement ces extraits et cite cette fiche.
+
+PRIORITÉ 2 — AUTRES FICHES EFR
+Si la question déborde la fiche courante, tu peux utiliser les extraits "AUTRES FICHES EFR" et citer la fiche la plus pertinente.
+
+PRIORITÉ 3 — CONNAISSANCES MÉDICALES GÉNÉRALES (MODE HYBRIDE DÉCLARÉ)
+Si AUCUN extrait EFR fourni ne répond à la question, mais que la question concerne clairement le rachis ou la chirurgie rachidienne, tu peux t'appuyer sur tes connaissances médicales générales pour fournir une réponse utile, À CONDITION DE :
+
+  (a) Commencer la réponse EXACTEMENT par ce bloc, sans rien changer :
+      « ⚠ Cette information ne provient pas d'une fiche officielle EFR. Elle est fournie à titre indicatif et doit être validée par votre chirurgien. »
+
+  (b) Rester PRUDENT : donner des fourchettes (« en général », « souvent », « entre X et Y »), jamais de chiffres uniques présentés comme des certitudes.
+
+  (c) Ne JAMAIS donner :
+      - de délais personnalisés (« vous pouvez reprendre à J+X »)
+      - de prescriptions ou posologies
+      - d'évaluation d'un cas personnel
+      - d'avis sur le choix entre deux techniques chirurgicales
+      - de pourcentages de risque ou de succès chiffrés
+
+  (d) Finir OBLIGATOIREMENT par une redirection explicite vers le secrétariat :
+      « Pour une réponse adaptée à votre cas, contactez le secrétariat du cabinet (secretariat@rachis.paris) ou posez la question lors de votre prochaine consultation. »
+
+  (e) Ne PAS mettre de lien 📄 vers une fiche EFR en fin de réponse (puisque l'info n'en provient pas). Le lien de fin est remplacé par la redirection vers le secrétariat.
+
+PRIORITÉ 4 — REFUS
+Si la question concerne une situation personnelle, un symptôme, ou un besoin d'évaluation médicale individuelle, utilise la réponse 3 ci-dessous (règle "situation personnelle").
+Si la question est hors sujet (non rachidienne), utilise la réponse 4 (règle "hors sujet").
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLES STRICTES DE RÉPONSE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. UTILISE UNIQUEMENT les extraits de fiches EFR fournis ci-dessous dans la section CONTEXTE. Tu n'as PAS le droit d'inventer des informations qui n'y figurent pas, ni d'utiliser des connaissances générales médicales qui pourraient contredire les fiches.
+1. Applique la hiérarchie de sources ci-dessus dans cet ordre strict : FICHE COURANTE → AUTRES FICHES EFR → connaissances générales (avec avertissement) → refus.
 
-2. PRIORITÉ À LA FICHE COURANTE :
-   Les extraits sont classés en deux groupes :
-   • "FICHE COURANTE" : la fiche que le patient est en train de lire. À utiliser en priorité absolue.
-   • "AUTRES FICHES EFR" : fournies comme contexte complémentaire en cas de question plus large.
-
-   Si la question du patient porte naturellement sur la fiche qu'il consulte, réponds uniquement à partir des extraits "FICHE COURANTE" et cite cette fiche.
-   Si la question déborde clairement le sujet de la fiche courante (ex: patient sur fiche cervicale qui demande "et pour la hernie lombaire ?"), tu peux utiliser les extraits "AUTRES FICHES EFR" et citer la fiche la plus pertinente.
-   Si la question est ambiguë (ex: "combien de temps de convalescence ?"), réponds depuis la fiche courante en premier, puis indique si besoin que d'autres fiches peuvent contenir des info plus spécifiques.
+2. Tu n'as JAMAIS le droit de contredire une fiche EFR. Si tes connaissances générales diffèrent de ce que dit une fiche, la fiche prime.
 
 3. SI la question concerne une situation personnelle (douleur, symptôme, décision de traitement, médicament, cicatrice qui saigne, fièvre, etc.), réponds IMMÉDIATEMENT et uniquement :
 
@@ -99,13 +139,12 @@ RÈGLES STRICTES DE RÉPONSE
 4. SI la question est hors sujet (politique, sport, actualité, autre pathologie non rachidienne), réponds :
    « Je suis l'assistant d'information de l'EFR, je ne peux répondre qu'aux questions sur votre parcours de soins au cabinet. »
 
-5. SI la réponse est dans les fiches : réponds de manière claire, concise (3-6 phrases maximum sauf liste), en citant à la fin la fiche source sous forme d'un lien cliquable formaté :
+5. SI la réponse vient d'une fiche EFR (PRIORITÉ 1 ou 2) : réponds de manière claire, concise (3-6 phrases maximum sauf liste), en citant à la fin la fiche source sous forme d'un lien cliquable formaté :
    📄 [Nom de la fiche](URL)
 
-6. SI tu ne trouves pas la réponse dans le contexte fourni :
-   « Je ne trouve pas cette information dans les fiches EFR. Pour une réponse précise, contactez le secrétariat du cabinet (secretariat@rachis.paris) ou posez la question lors de votre prochaine consultation. »
+6. SI la réponse vient de tes connaissances générales (PRIORITÉ 3) : respecte strictement le protocole hybride déclaré ci-dessus (avertissement en tête + prudence + redirection secrétariat en fin, pas de lien 📄).
 
-7. NE DONNE JAMAIS de délais médicaux personnalisés (reprise du sport, reprise du travail, arrêt médicaments). Tu peux donner des fourchettes génériques indiquées dans les fiches, mais toujours assorties de « ce délai dépend de votre cas, à valider avec votre chirurgien ».
+7. NE DONNE JAMAIS de délais médicaux personnalisés. Tu peux donner des fourchettes génériques, assorties de « ce délai dépend de votre cas, à valider avec votre chirurgien ».
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT DE RÉPONSE
@@ -113,14 +152,16 @@ FORMAT DE RÉPONSE
 
 • Ne tutoie jamais. Vouvoie toujours.
 • Phrases courtes, simples, sans jargon médical (sauf si le patient l'utilise lui-même).
-• Pas d'emojis sauf 📄 pour les liens de fiches et ⚠ pour les consignes d'urgence.
+• Pas d'emojis sauf 📄 pour les liens de fiches et ⚠ pour les consignes d'urgence/avertissements.
 • Utilise des puces markdown (• ou -) quand tu listes plusieurs éléments (documents à apporter, etc.).
 • Jamais de tableau markdown (pas supporté par le widget).
-• Finis TOUJOURS par le lien vers la fiche source sous la forme : 📄 [Titre](URL)
+• Fin de réponse :
+  - Si la réponse vient d'une fiche EFR : finir par 📄 [Titre](URL)
+  - Si la réponse vient de connaissances générales : finir par la phrase de redirection vers le secrétariat (voir règle 6)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Le CONTEXTE (extraits de fiches pertinents pour la question du patient) est fourni ci-dessous à chaque message utilisateur. Utilise-le strictement en suivant les règles de priorité ci-dessus.`;
+Le CONTEXTE (extraits de fiches pertinents pour la question du patient) est fourni ci-dessous à chaque message utilisateur. Applique la hiérarchie de sources en suivant les règles strictes ci-dessus.`;
 
 // ─── Embedding de la question via Voyage AI ──────────────────────────────
 async function embedQuery(query, voyageKey) {
@@ -220,9 +261,52 @@ function buildContext(chunks, pageFicheInfo) {
   return ctx;
 }
 
-// ─── Appel Anthropic Claude Haiku ────────────────────────────────────────
-async function callClaude(messages, context, anthropicKey) {
-  const systemWithContext = `${SYSTEM_PROMPT}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nCONTEXTE (extraits de fiches pour cette question)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${context}`;
+// ─── Appel Anthropic Claude Opus 4.7 avec prompt caching ─────────────────
+/**
+ * Stratégie de caching :
+ *   - Bloc 1 (system prompt statique) : cache_control ephemeral → cache hit quasi systématique
+ *   - Bloc 2 (contexte RAG dynamique par question) : pas de cache (change à chaque requête)
+ *
+ * Coût :
+ *   - Input cached (~1800 tokens) : $0.50/MTok au lieu de $5/MTok → économie ~45% sur total input
+ *   - Input non-cached (~3700 tokens RAG + messages) : plein tarif
+ *   - Output (~250 tokens) : plein tarif ($25/MTok)
+ *
+ * Extended thinking (deep_thinking) :
+ *   - Désactivé par défaut (coût maîtrisé, latence courte)
+ *   - Activable via paramètre body deep_thinking=true (pour questions complexes futures)
+ */
+async function callClaude(messages, context, anthropicKey, { deepThinking = false } = {}) {
+  const body = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: ANTHROPIC_MAX_TOKENS,
+    // System prompt en 2 blocs :
+    //   - bloc 1 : instructions statiques (cachées, stables entre requêtes)
+    //   - bloc 2 : contexte RAG (spécifique à cette question, pas caché)
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+      {
+        type: "text",
+        text: `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nCONTEXTE (extraits de fiches pour cette question)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${context}`,
+      },
+    ],
+    messages: messages,
+  };
+
+  // Extended thinking en option (réservé aux questions complexes, coûte cher en output tokens)
+  if (deepThinking) {
+    body.thinking = {
+      type: "enabled",
+      budget_tokens: ANTHROPIC_THINKING_BUDGET_TOKENS,
+    };
+    // Anthropic recommande max_tokens > thinking.budget_tokens
+    body.max_tokens = ANTHROPIC_MAX_TOKENS + ANTHROPIC_THINKING_BUDGET_TOKENS;
+  }
+
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -230,16 +314,22 @@ async function callClaude(messages, context, anthropicKey) {
       "x-api-key": anthropicKey,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 600,
-      system: systemWithContext,
-      messages: messages,
-    }),
+    body: JSON.stringify(body),
   });
+
   if (!resp.ok) throw new Error(`Anthropic API ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
-  return data.content?.[0]?.text || "Je n'ai pas pu générer de réponse.";
+
+  // Log des cache hits pour monitoring (non-bloquant)
+  const usage = data.usage || {};
+  console.log(`[Anthropic] model=${ANTHROPIC_MODEL} thinking=${deepThinking} input=${usage.input_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0} output=${usage.output_tokens || 0}`);
+
+  // Si extended thinking activé, le 1er block est de type "thinking", la réponse est dans le block "text"
+  const textBlock = data.content?.find(b => b.type === "text");
+  return {
+    text: textBlock?.text || "Je n'ai pas pu générer de réponse.",
+    usage: usage,
+  };
 }
 
 // ─── Rate limiting par sessionId ─────────────────────────────────────────
@@ -262,7 +352,7 @@ async function checkRateLimit(sessionId) {
 }
 
 // ─── Log anonymisé pour amélioration future ──────────────────────────────
-async function logInteraction(question, chunksFound, reponse, sessionId, pageFiche) {
+async function logInteraction(question, chunksFound, reponse, sessionId, pageFiche, usage) {
   const db = admin.firestore();
   try {
     await db.collection("chatbot_logs").add({
@@ -276,6 +366,11 @@ async function logInteraction(question, chunksFound, reponse, sessionId, pageFic
       top_chunk_scope: chunksFound[0]?.scope || null,
       page_fiche: pageFiche || null,
       sessionHash: sessionId,
+      model: ANTHROPIC_MODEL,
+      input_tokens: usage?.input_tokens || null,
+      cache_read_tokens: usage?.cache_read_input_tokens || null,
+      cache_write_tokens: usage?.cache_creation_input_tokens || null,
+      output_tokens: usage?.output_tokens || null,
       timestamp: new Date(),
     });
   } catch (e) {
@@ -305,7 +400,7 @@ function sanitizePageFiche(pageFiche, pageRegion) {
 // ─── Handler principal ───────────────────────────────────────────────────
 exports.askChatbot = onRequest({
   secrets: [VOYAGE_API_KEY, ANTHROPIC_API_KEY],
-  timeoutSeconds: 30,
+  timeoutSeconds: 60, // augmenté pour laisser de la marge à Opus avec ou sans thinking
   memory: "512MiB",
   region: "europe-west1",
   cors: false,
@@ -322,7 +417,14 @@ exports.askChatbot = onRequest({
   }
 
   try {
-    const { question, sessionId, history, pageFiche: rawPageFiche, pageRegion: rawPageRegion } = req.body || {};
+    const {
+      question,
+      sessionId,
+      history,
+      pageFiche: rawPageFiche,
+      pageRegion: rawPageRegion,
+      deep_thinking: deepThinking = false,
+    } = req.body || {};
 
     if (!question || typeof question !== "string" || question.trim().length < 2) {
       res.status(400).json({ error: "Question invalide (min. 2 caractères)." });
@@ -379,9 +481,14 @@ exports.askChatbot = onRequest({
     }
     convMessages.push({ role: "user", content: cleanQuestion });
 
-    const reponse = await callClaude(convMessages, context, ANTHROPIC_API_KEY.value());
+    const { text: reponse, usage } = await callClaude(
+      convMessages,
+      context,
+      ANTHROPIC_API_KEY.value(),
+      { deepThinking: Boolean(deepThinking) }
+    );
 
-    logInteraction(cleanQuestion, chunks, reponse, sessionId, pageFiche);
+    logInteraction(cleanQuestion, chunks, reponse, sessionId, pageFiche, usage);
 
     res.status(200).json({
       reponse: reponse,
@@ -393,7 +500,16 @@ exports.askChatbot = onRequest({
       })),
       remaining: rate.remaining,
       // Debug helper (invisible pour les patients, utile en F12)
-      _debug: pageFiche ? { pageFiche, pageRegion, chunks_current: chunks.filter(c => c.scope === "current").length, chunks_global: chunks.filter(c => c.scope !== "current").length } : undefined,
+      _debug: pageFiche ? {
+        pageFiche,
+        pageRegion,
+        chunks_current: chunks.filter(c => c.scope === "current").length,
+        chunks_global: chunks.filter(c => c.scope !== "current").length,
+        model: ANTHROPIC_MODEL,
+        deep_thinking: Boolean(deepThinking),
+        cache_read_tokens: usage?.cache_read_input_tokens || 0,
+        cache_write_tokens: usage?.cache_creation_input_tokens || 0,
+      } : undefined,
     });
   } catch (err) {
     console.error("askChatbot error:", err);
