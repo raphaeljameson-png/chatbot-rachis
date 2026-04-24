@@ -4,7 +4,6 @@ node_modules/
 firebase-debug.log
 firebase-debug.*.log
 .firebase/
-.firebaserc
 .env
 .env.local
 *.local
@@ -12,3 +11,8 @@ dist/
 build/
 .vscode/
 .idea/
+
+# Clés de service Firebase (TRÈS sensible) — ne JAMAIS committer
+firebase-service-account*.json
+service-account*.json
+*-serviceaccount*.json
