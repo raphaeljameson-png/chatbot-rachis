@@ -11,10 +11,18 @@
  *   6. Écriture dans Firestore collection `fiches_chunks`
  *
  * Usage :
- *   source .env.local                                    # charge la clé Voyage sans la mettre en ligne de commande
- *   GOOGLE_APPLICATION_CREDENTIALS=./firebase-service-account.json node scripts/index-fiches.js
+ *   VOYAGE_API_KEY=pa-xxx \
+ *   GOOGLE_APPLICATION_CREDENTIALS=./firebase-service-account.json \
+ *   node scripts/index-fiches.js
  *
  * Peut être relancé : il fait un upsert (efface puis réécrit tout).
+ *
+ * Gestion des rate limits :
+ *   - Par défaut : batches de 8 chunks avec pause de 22s entre batches (adapté au tier gratuit
+ *     Voyage sans CB : 3 RPM / 10k TPM). Durée totale : ~10 min pour ~220 chunks.
+ *   - Si tu ajoutes une CB sur Voyage (= rate limits standard 300 RPM / 1M TPM) :
+ *     set VOYAGE_FAST=1 pour passer à des batches de 64 et une pause de 0.3s (durée ~30s).
+ *   - Retry automatique avec backoff exponentiel si 429 reçu malgré tout.
  */
 
 const admin = require("firebase-admin");
@@ -53,24 +61,24 @@ const FICHES = [
 const CHUNK_WORDS = 300;
 const CHUNK_OVERLAP = 50;
 
+// Rate limit config
+// Tier gratuit Voyage (sans CB) : 3 RPM, 10k TPM. On reste TRÈS conservateur pour éviter les 429.
+// Tier payant (avec CB enregistrée) : 300 RPM, 1M TPM.
+const SLOW_MODE = process.env.VOYAGE_FAST !== "1";
+const BATCH_SIZE = SLOW_MODE ? 8 : 64;
+const SLEEP_BETWEEN_BATCHES_MS = SLOW_MODE ? 22000 : 300;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Trouve le contenu complet d'une balise ouvrante donnée en comptant les niveaux
- * d'imbrication. Beaucoup plus fiable qu'une regex simple sur du HTML imbriqué.
- */
 function extractBalancedElement(html, openingTagRegex) {
   const m = html.match(openingTagRegex);
   if (!m) return null;
   const startIdx = m.index + m[0].length;
   let depth = 1;
   let i = startIdx;
-  // Tag name générique (on s'attend à <div> pour ce use-case, mais on le généralise)
   const tagName = m[0].match(/^<(\w+)/)[1].toLowerCase();
   const openRx = new RegExp(`<${tagName}\\b[^>]*>`, "gi");
   const closeRx = new RegExp(`</${tagName}\\s*>`, "gi");
-  openRx.lastIndex = startIdx;
-  closeRx.lastIndex = startIdx;
   while (depth > 0 && i < html.length) {
     openRx.lastIndex = i;
     closeRx.lastIndex = i;
@@ -94,16 +102,13 @@ function stripHtml(html) {
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<!--[\s\S]*?-->/g, " ")
-    // Retire les éléments de navigation / impression qui parasitent le contenu
     .replace(/<div[^>]+class=["'][^"']*\btoolbar\b[^"']*["'][\s\S]*?<\/div>\s*<\/div>/gi, " ")
     .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
     .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
     .replace(/<header\s+class=["'][^"']*\btop\b[^"']*["'][\s\S]*?<\/header>/gi, " ")
-    // Assure des retours à la ligne lisibles entre blocs
     .replace(/<\/(p|div|li|h[1-6]|br|tr|section|article)>/gi, "\n")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
-    // Nettoie les entités HTML
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -111,7 +116,6 @@ function stripHtml(html) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&[a-z0-9]+;/gi, " ")
-    // Retire les annotations [cite: X, Y] présentes dans le livret transversal
     .replace(/\[cite:\s*[\d,\s]+\]/g, "")
     .replace(/[ \t]+/g, " ")
     .replace(/\n\s*\n+/g, "\n\n")
@@ -139,13 +143,7 @@ function extractFAQ(html) {
   return faqs;
 }
 
-/**
- * Extrait le corps principal de la fiche.
- * Structure attendue : <div class="wrap"><div class="page">...contenu...</div></div>
- * On privilégie la div.page (contenu imprimable), sinon fallback sur .wrap, <main>, <body>.
- */
 function extractBody(html) {
-  // On cherche d'abord la div.page (structure standard des fiches EFR)
   let content = extractBalancedElement(html, /<div[^>]+class=["'][^"']*\bpage\b[^"']*["'][^>]*>/i);
   if (!content) {
     content = extractBalancedElement(html, /<div[^>]+class=["'][^"']*\bwrap\b[^"']*["'][^>]*>/i);
@@ -175,28 +173,57 @@ function chunkText(text, wordsPerChunk = CHUNK_WORDS, overlap = CHUNK_OVERLAP) {
   return chunks;
 }
 
-async function embedBatch(texts, voyageApiKey, inputType = "document") {
-  const resp = await fetch("https://api.voyageai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${voyageApiKey}`,
-    },
-    body: JSON.stringify({
-      input: texts,
-      model: "voyage-multilingual-2",
-      input_type: inputType,
-    }),
-  });
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Voyage API error ${resp.status}: ${err}`);
-  }
-  const data = await resp.json();
-  return data.data.map(d => d.embedding);
-}
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Appel Voyage avec retry automatique sur 429 (rate limit).
+ * Backoff exponentiel : 30s, 60s, 120s.
+ */
+async function embedBatchWithRetry(texts, voyageApiKey, inputType = "document", maxRetries = 4) {
+  let attempt = 0;
+  while (true) {
+    try {
+      const resp = await fetch("https://api.voyageai.com/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${voyageApiKey}`,
+        },
+        body: JSON.stringify({
+          input: texts,
+          model: "voyage-multilingual-2",
+          input_type: inputType,
+        }),
+      });
+      if (resp.status === 429) {
+        if (attempt >= maxRetries) {
+          const err = await resp.text();
+          throw new Error(`Voyage 429 après ${maxRetries} retries: ${err}`);
+        }
+        const waitMs = 30000 * Math.pow(2, attempt);
+        console.log(`      ⏳ 429 rate limit, attente ${Math.round(waitMs / 1000)}s puis retry...`);
+        await sleep(waitMs);
+        attempt++;
+        continue;
+      }
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(`Voyage API error ${resp.status}: ${err}`);
+      }
+      const data = await resp.json();
+      return data.data.map(d => d.embedding);
+    } catch (err) {
+      if (attempt < maxRetries && /fetch failed|ETIMEDOUT|ECONNRESET/.test(String(err))) {
+        const waitMs = 5000 * (attempt + 1);
+        console.log(`      ⏳ erreur réseau, attente ${waitMs / 1000}s puis retry...`);
+        await sleep(waitMs);
+        attempt++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 // ─── Pipeline principal ───────────────────────────────────────────────────
 
@@ -204,14 +231,15 @@ async function main() {
   const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
   if (!VOYAGE_API_KEY) {
     console.error("ERREUR : VOYAGE_API_KEY manquante dans l'environnement.");
-    console.error("Astuce : source .env.local avant de lancer le script.");
     process.exit(1);
   }
 
   if (!admin.apps.length) admin.initializeApp();
   const db = admin.firestore();
 
-  console.log(`\n=== Indexation ${FICHES.length} fiches EFR ===\n`);
+  console.log(`\n=== Indexation ${FICHES.length} fiches EFR ===`);
+  console.log(`Mode : ${SLOW_MODE ? "LENT (tier gratuit Voyage, ~10min)" : "RAPIDE (tier payant, ~30s)"}`);
+  console.log(`  Batch size : ${BATCH_SIZE} | Pause entre batches : ${SLEEP_BETWEEN_BATCHES_MS}ms\n`);
 
   console.log("1. Nettoyage de l'ancienne collection fiches_chunks...");
   const oldSnap = await db.collection("fiches_chunks").get();
@@ -245,7 +273,6 @@ async function main() {
     const ficheUrl = `${PORTAL_BASE_URL}/${fiche.path}`;
     const ficheId = fiche.path.replace(/[\/\.]/g, "_").replace(/_html$/, "");
 
-    // FAQ : un chunk par Q/R
     for (let i = 0; i < faqs.length; i++) {
       const f = faqs[i];
       allChunks.push({
@@ -260,10 +287,8 @@ async function main() {
       });
     }
 
-    // Corps : chunking par fenêtres de mots
     const bodyChunks = chunkText(body);
     for (let i = 0; i < bodyChunks.length; i++) {
-      // Préfixer chaque chunk avec le titre de la fiche aide les embeddings à localiser le contexte
       const textePrefixe = `[${fiche.titre}]\n\n${bodyChunks[i]}`;
       allChunks.push({
         id: `${ficheId}__body_${i}`,
@@ -281,25 +306,25 @@ async function main() {
   console.log(`\n   Total chunks : ${allChunks.length}`);
   console.log(`   Total mots corps indexé : ${totalBodyWords}\n`);
 
-  console.log("3. Génération des embeddings Voyage AI (voyage-multilingual-2)...");
-  const BATCH_SIZE = 64;
+  const totalBatches = Math.ceil(allChunks.length / BATCH_SIZE);
+  const estimatedSec = Math.round((totalBatches * SLEEP_BETWEEN_BATCHES_MS) / 1000);
+  console.log(`3. Génération des embeddings Voyage AI (voyage-multilingual-2)...`);
+  console.log(`   ${totalBatches} batches à traiter — durée estimée ~${estimatedSec}s`);
+
   for (let i = 0; i < allChunks.length; i += BATCH_SIZE) {
     const batch = allChunks.slice(i, i + BATCH_SIZE);
     const texts = batch.map(c => c.texte);
-    const embeddings = await embedBatch(texts, VOYAGE_API_KEY, "document");
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const embeddings = await embedBatchWithRetry(texts, VOYAGE_API_KEY, "document");
     for (let j = 0; j < batch.length; j++) {
       batch[j].embedding = embeddings[j];
     }
-    console.log(`   ✓ batch ${Math.floor(i / BATCH_SIZE) + 1} — ${batch.length} embeddings`);
-    await sleep(300);
-  }
+    console.log(`   ✓ batch ${batchNum}/${totalBatches} — ${batch.length} embeddings`);
 
-  console.log("\n4. Écriture vers Firestore collection `fiches_chunks`...");
-  const WRITE_BATCH = 400;
-  for (let i = 0; i < allChunks.length; i += WRITE_BATCH) {
+    // Écriture incrémentale dans Firestore (pas d'attente finale, et si le script plante plus tard,
+    // au moins une partie des chunks sont en base).
     const writeBatch = db.batch();
-    const slice = allChunks.slice(i, i + WRITE_BATCH);
-    for (const c of slice) {
+    for (const c of batch) {
       const { id, embedding, ...rest } = c;
       writeBatch.set(db.collection("fiches_chunks").doc(id), {
         ...rest,
@@ -308,10 +333,14 @@ async function main() {
       });
     }
     await writeBatch.commit();
-    console.log(`   ✓ écrit ${Math.min(i + WRITE_BATCH, allChunks.length)}/${allChunks.length}`);
+
+    // Pause avant le prochain batch (sauf dernier)
+    if (i + BATCH_SIZE < allChunks.length) {
+      await sleep(SLEEP_BETWEEN_BATCHES_MS);
+    }
   }
 
-  console.log(`\n=== Indexation terminée : ${allChunks.length} chunks ===\n`);
+  console.log(`\n=== Indexation terminée : ${allChunks.length} chunks écrits dans Firestore ===\n`);
   console.log("Prochaines étapes :");
   console.log("  1. Tester avec : node scripts/test-query.js \"ma question\"");
   console.log("  2. Déployer les Functions : firebase deploy --only functions");
