@@ -4,13 +4,16 @@ Le widget s'intègre dans le repo [`fiches-information-patient`](https://github.
 
 Recommandation : l'ajouter sur **toutes les pages** du portail, c'est le plus simple et c'est cohérent du point de vue du patient.
 
+> **Project ID Firebase** : `chatbot-rachis`
+> **URL de la Function askChatbot** : `https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot`
+
 ---
 
 ## Où héberger le widget.js
 
 Deux options :
 
-### Option A — hébergé depuis chatbot-rachis (GitHub Pages)
+### Option A — hébergé depuis chatbot-rachis (GitHub Pages) — recommandée
 
 1. Dans le repo `chatbot-rachis`, **active GitHub Pages** :
    - Settings → Pages → Source : Deploy from a branch → Branch : `main` → Folder : `/ (root)` → Save
@@ -19,7 +22,7 @@ Deux options :
    https://raphaeljameson-png.github.io/chatbot-rachis/widget/widget.js
    ```
 
-Avantage : versionning automatique, tu modifies le widget dans le repo, il se met à jour partout après quelques minutes de cache.
+Avantage : versioning automatique, tu modifies le widget dans le repo, il se met à jour partout après quelques minutes de cache.
 
 ### Option B — copié dans fiches-information-patient
 
@@ -39,13 +42,13 @@ Juste **avant** la balise `</body>` de l'index, ajouter :
 ```html
 <script
   src="https://raphaeljameson-png.github.io/chatbot-rachis/widget/widget.js"
-  data-api-url="https://europe-west1-TON-PROJECT-ID.cloudfunctions.net/askChatbot"
+  data-api-url="https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot"
   data-context="default"
   defer>
 </script>
 ```
 
-**Remplace `TON-PROJECT-ID` par l'ID de ton projet Firebase** (ex. `chatbot-rachis-a1b2c3`).
+C'est tout. Pas de placeholder à remplacer, le Project ID est déjà intégré.
 
 ---
 
@@ -57,26 +60,26 @@ Tu peux le faire manuellement (22 fichiers) ou via un petit script bash :
 
 ```bash
 cd fiches-information-patient
+
+# macOS (utilise sed -i.bak puis supprime les .bak)
 for f in $(find . -name "*.html"); do
-  # N'insère que si pas déjà présent
   if ! grep -q "chatbot-rachis/widget" "$f"; then
-    # Remplace </body> par le bloc script + </body>
-    sed -i.bak 's|</body>|  <script src="https://raphaeljameson-png.github.io/chatbot-rachis/widget/widget.js" data-api-url="https://europe-west1-TON-PROJECT-ID.cloudfunctions.net/askChatbot" data-context="default" defer></script>\n</body>|' "$f"
+    sed -i.bak 's|</body>|  <script src="https://raphaeljameson-png.github.io/chatbot-rachis/widget/widget.js" data-api-url="https://europe-west1-chatbot-rachis.cloudfunctions.net/askChatbot" data-context="default" defer></script>\n</body>|' "$f"
   fi
 done
-# Vérifier le résultat avant de commiter
-grep -l "chatbot-rachis/widget" *.html cervical/*.html lombaire/*.html procedures/*.html sacro-iliaque/*.html ressources/*.html
-# Si OK, supprimer les backups
 find . -name "*.bak" -delete
+
+# Vérifier le résultat
+grep -rl "chatbot-rachis/widget" --include="*.html" .
 ```
 
-(Sur macOS, `sed -i.bak` est la syntaxe correcte ; sur Linux, `sed -i` sans extension.)
+Sur Linux remplace `sed -i.bak` par `sed -i` (et supprime la ligne `find -delete`).
 
 ---
 
 ## Contextes avancés pour QR codes
 
-Le widget accepte un attribut `data-context` qui change les **questions fréquentes** affichées à l'ouverture et le message d'accueil :
+Le widget accepte un attribut `data-context` qui change les **questions fréquentes** affichées à l'ouverture :
 
 | Contexte | Cas d'usage | Suggestions |
 |----------|-------------|-------------|
@@ -113,4 +116,4 @@ Il faudra que la page `hernie-discale.html` ait le widget intégré avec `data-c
 
 Si tu veux désactiver le chatbot temporairement (maintenance, problème) : retire simplement la balise `<script>` des pages. Pas besoin de toucher Firebase.
 
-Ou plus rapide : supprime `ALLOWED_ORIGINS` du backend (le CORS bloquera tous les appels) et redéploie.
+Ou plus rapide : supprime tous les domaines de `ALLOWED_ORIGINS` dans `functions/index.js` (le CORS bloquera tous les appels) et redéploie avec `firebase deploy --only functions`.
