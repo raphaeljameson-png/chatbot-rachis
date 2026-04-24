@@ -1,5 +1,34 @@
 {
-  "indexes": [],
+  "indexes": [
+    {
+      "collectionGroup": "fiches_chunks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "fiche_path", "order": "ASCENDING" },
+        {
+          "fieldPath": "embedding",
+          "vectorConfig": {
+            "dimension": 1024,
+            "flat": {}
+          }
+        }
+      ]
+    },
+    {
+      "collectionGroup": "fiches_chunks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "fiche_region", "order": "ASCENDING" },
+        {
+          "fieldPath": "embedding",
+          "vectorConfig": {
+            "dimension": 1024,
+            "flat": {}
+          }
+        }
+      ]
+    }
+  ],
   "fieldOverrides": [
     {
       "collectionGroup": "fiches_chunks",
