@@ -198,11 +198,14 @@ async function findRelevantChunksGlobal(queryEmbedding, limit = 5) {
 
 /**
  * Stratégie de récupération "scope souple" — in-memory split.
- * Firestore ne dispose pas encore des index composites (fiche_path + embedding)
- * nécessaires au pré-filtrage natif. On compense en récupérant les top 20 globaux
- * et en séparant en mémoire : chunks de la fiche courante (scope="current") vs
- * autres fiches (scope="global"). Pénalité minimale : 216 chunks au total.
- * Quand les index composites seront READY, on pourra revenir à 2 passes parallèles.
+ * On récupère les top 20 chunks globaux puis on sépare en mémoire :
+ *   - scope="current" : chunks de la fiche courante (max 4)
+ *   - scope="global"  : autres fiches les plus pertinentes (max 4)
+ *
+ * Les index composites (fiche_path + embedding, fiche_region + embedding) sont
+ * déclarés dans firestore.indexes.json et permettraient un pré-filtrage natif
+ * via deux findNearest parallèles. Tant qu'on reste sur ~220 chunks indexés,
+ * la lecture globale reste peu coûteuse et plus simple.
  */
 async function retrieveChunks(queryEmbedding, { pageFiche, pageRegion }) {
   if (!pageFiche || !pageRegion) {
@@ -267,10 +270,10 @@ function buildContext(chunks, pageFicheInfo) {
  *   - Bloc 1 (system prompt statique) : cache_control ephemeral → cache hit quasi systématique
  *   - Bloc 2 (contexte RAG dynamique par question) : pas de cache (change à chaque requête)
  *
- * Coût :
- *   - Input cached (~1800 tokens) : $0.50/MTok au lieu de $5/MTok → économie ~45% sur total input
- *   - Input non-cached (~3700 tokens RAG + messages) : plein tarif
- *   - Output (~250 tokens) : plein tarif ($25/MTok)
+ * Économie : le system prompt (~1800 tokens, lu à chaque requête) est facturé au
+ * tarif "cache read" (≈ 10% du tarif input standard d'Opus) au lieu du plein tarif,
+ * ce qui réduit le coût total d'entrée d'environ 45% sur le trafic attendu.
+ * Le contexte RAG et les messages restent au plein tarif.
  *
  * Extended thinking (deep_thinking) :
  *   - Désactivé par défaut (coût maîtrisé, latence courte)
@@ -333,22 +336,27 @@ async function callClaude(messages, context, anthropicKey, { deepThinking = fals
 }
 
 // ─── Rate limiting par sessionId ─────────────────────────────────────────
+// Lecture + écriture en transaction pour rester exact en cas de requêtes
+// parallèles d'une même session.
 async function checkRateLimit(sessionId) {
   const db = admin.firestore();
   const today = new Date().toISOString().slice(0, 10);
   const docRef = db.collection("chatbot_rate_limits").doc(`${sessionId}_${today}`);
-  const snap = await docRef.get();
-  const count = snap.exists ? (snap.data().count || 0) : 0;
   const LIMIT = 30;
-  if (count >= LIMIT) {
-    return { allowed: false, remaining: 0 };
-  }
-  await docRef.set({
-    count: count + 1,
-    lastUpdate: new Date(),
-    sessionId: sessionId,
-  }, { merge: true });
-  return { allowed: true, remaining: LIMIT - count - 1 };
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    const count = snap.exists ? (snap.data().count || 0) : 0;
+    if (count >= LIMIT) {
+      return { allowed: false, remaining: 0 };
+    }
+    tx.set(docRef, {
+      count: count + 1,
+      lastUpdate: new Date(),
+      sessionId: sessionId,
+    }, { merge: true });
+    return { allowed: true, remaining: LIMIT - count - 1 };
+  });
 }
 
 // ─── Log anonymisé pour amélioration future ──────────────────────────────

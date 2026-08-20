@@ -21,8 +21,8 @@ Le chatbot ne stocke aucune donnée patient identifiante : pas de nom, pas de pr
 [Firebase Functions — projet chatbot-rachis]
    askChatbot :
      1. Embed query via Voyage (voyage-multilingual-2)
-     2. findNearest sur Firestore → top 5 chunks
-     3. Build context + call Claude Haiku
+     2. findNearest sur Firestore → top chunks (priorisation fiche courante)
+     3. Build context + call Claude Opus 4.7 (avec prompt caching)
      4. Log anonymisé, retour au widget
                    │
                    │ read/write
@@ -36,7 +36,7 @@ Le chatbot ne stocke aucune donnée patient identifiante : pas de nom, pas de pr
 ## Stack
 
 - **Voyage AI** — modèle `voyage-multilingual-2` (1024 dimensions, français/multilingue, plan gratuit généreux).
-- **Anthropic Claude Haiku 4.5** — génération de réponses ancrées sur le contexte fourni.
+- **Anthropic Claude Opus 4.7** (`claude-opus-4-7`) — génération de réponses ancrées sur le contexte fourni, avec prompt caching sur le system prompt pour réduire le coût d'entrée d'environ 45 %.
 - **Firebase Functions** (Node.js 20, région `europe-west1`).
 - **Firestore vector search** (natif, pas de base vectorielle externe).
 - **Widget** vanilla JS sans dépendance.
@@ -50,7 +50,7 @@ Intégration dans le portail des fiches : voir [`docs/INTEGRATION.md`](docs/INTE
 ## Coût estimé
 
 - **Voyage AI** : 0 € (plan gratuit largement suffisant pour le volume attendu)
-- **Claude Haiku** : ~5-15 €/mois selon trafic (~1 € pour 1000 conversations)
+- **Claude Opus 4.7** : ~10-20 €/mois selon trafic, grâce au prompt caching (le system prompt étant lu depuis le cache à tarif réduit sur la quasi-totalité des requêtes)
 - **Firebase** : 0 € (largement sous le quota gratuit du plan Blaze)
 - **Total** : ~10-20 €/mois à régime de croisière
 
